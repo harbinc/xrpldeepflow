@@ -1,10 +1,10 @@
 {
-  "name": "xrpl-deepflow-render",
-  "version": "1.0.0",
+  "name": "xrpl-deepflow",
+  "version": "1.1.0",
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "build": "echo 'no build step'"
+    "build": "echo \"no build step\""
   },
   "dependencies": {
     "cors": "^2.8.5",
