@@ -16,19 +16,24 @@ app.use(morgan('tiny'));
 app.use(cors());
 app.use(express.json());
 
-// ---- ENV
+// ---------------- ENV ----------------
 const PORT = process.env.PORT || 8080;
-const MIN_XRP = parseInt(process.env.MIN_XRP || '1000000', 10);
+
+// IMPORTANT: Treat MIN_XRP as **XRP units** (not drops).
+// Default: 1,000,000 XRP (i.e., 1 million XRP)
+const MIN_XRP = Number(process.env.MIN_XRP || 1_000_000);
+
+// Upstream sources
 const XRPSCAN_SEARCH_URL =
-  process.env.XRPSCAN_SEARCH_URL || 'https://console.xrpscan.com/api/v1/search'; // may 500
+  process.env.XRPSCAN_SEARCH_URL || 'https://console.xrpscan.com/api/v1/search';
 const XRPSCAN_WELL_KNOWN =
   process.env.XRPSCAN_WELL_KNOWN || 'https://api.xrpscan.com/api/v1/names/well-known';
 const PRICE_API =
   process.env.PRICE_API || 'https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd';
 const XRPL_WS_URL =
-  process.env.XRPL_WS_URL || 'wss://xrplcluster.com'; // public cluster; see xrpl.org "Public Servers"
+  process.env.XRPL_WS_URL || 'wss://xrplcluster.com';
 
-// ---- CACHE
+// ---------------- CACHE ----------------
 const cache = new Map();
 const setCache = (k, v, ttlMs = 30_000) => cache.set(k, { v, exp: Date.now() + ttlMs });
 const getCache = (k) => {
@@ -36,7 +41,7 @@ const getCache = (k) => {
   return it && it.exp > Date.now() ? it.v : null;
 };
 
-// ---- FETCH HELPERS ----------------------------------------------------------
+// ---------------- HELPERS ----------------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function fetchJsonSafe(url, opts = {}, { timeoutMs = 15000, retries = 2, backoffMs = 400 } = {}) {
@@ -52,25 +57,21 @@ async function fetchJsonSafe(url, opts = {}, { timeoutMs = 15000, retries = 2, b
       }
       if (ctype.includes('application/json')) return res.json();
       const txt = await res.text();
-      try { return JSON.parse(txt); } catch { throw new Error(`Non-JSON: ${ctype || 'unknown'}`); }
+      try { return JSON.parse(txt); } catch { throw new Error(`Non-JSON (${ctype || 'unknown'})`); }
     } finally {
       clearTimeout(t);
     }
   };
-
-  let err;
   for (let i = 0; i <= retries; i++) {
     try { return await attempt(); }
     catch (e) {
-      err = e;
-      console.warn(`[fetchJsonSafe] attempt ${i + 1} failed:`, String(e).slice(0, 180));
-      if (i < retries) await sleep(backoffMs * (i + 1));
+      if (i === retries) return null;
+      await sleep(backoffMs * (i + 1));
     }
   }
   return null;
 }
 
-// ---- XRPSCAN NORMALIZATION --------------------------------------------------
 function extractRecords(j) {
   if (Array.isArray(j)) return j;
   if (Array.isArray(j?.hits)) return j.hits;
@@ -79,6 +80,7 @@ function extractRecords(j) {
   if (Array.isArray(j?.data)) return j.data;
   return [];
 }
+
 function getField(obj, ...keys) {
   for (const k of keys) {
     const v = obj?.[k];
@@ -93,7 +95,7 @@ async function getWellKnown() {
   if (c) return c;
   const j = await fetchJsonSafe(XRPSCAN_WELL_KNOWN, {}, { timeoutMs: 15000, retries: 2 });
   const dict = {};
-  if (Array.isArray(j)) for (const x of j) dict[x.address] = x; // {address,label,category}
+  if (Array.isArray(j)) for (const x of j) dict[x.address] = x;
   setCache(ck, dict, 10 * 60 * 1000);
   return dict;
 }
@@ -128,7 +130,6 @@ function scoreEvent(amt, direction, sender, receiver, known) {
   return Math.min(100, logSize + ent + dirb);
 }
 
-// ---- DEDUPE -----------------------------------------------------------------
 function makeKey(row) {
   return row.hash || `${row.from}|${row.to}|${row.amount_xrp}|${row.ledger_index || ''}|${new Date(row.ts).getTime()}`;
 }
@@ -150,40 +151,39 @@ function dedupe(items) {
   return Array.from(byKey.values());
 }
 
-// ---- XRPL LIVE FALLBACK (WebSocket) ----------------------------------------
-// Keep a rolling buffer of recent large Payment tx from the network.
+// ---------------- XRPL LIVE FALLBACK ----------------
 const liveBuffer = [];
-const MAX_BUFFER = 1000; // ~recent few minutes, depending on threshold
+const MAX_BUFFER = 1000;
+let liveConnected = false;
 let xrplClient = null;
 
 async function startXRPLStream() {
   try {
     xrplClient = new xrpl.Client(XRPL_WS_URL, { connectionTimeout: 15000 });
     await xrplClient.connect();
-
-    // Subscribe to validated transactions stream
     await xrplClient.request({ command: 'subscribe', streams: ['transactions'] });
+    liveConnected = true;
+    console.log(`XRPL WebSocket connected: ${XRPL_WS_URL}`);
 
     xrplClient.on('transaction', async (msg) => {
       try {
+        if (!msg.validated) return; // only validated tx to avoid noise
         const tx = msg?.transaction;
-        const meta = msg?.meta;
         if (!tx || tx.TransactionType !== 'Payment') return;
 
-        // Only XRP (Amount is string drops for XRP; object means IOU)
+        // Only XRP, not IOUs: XRP Amount is a string (drops)
         if (typeof tx.Amount !== 'string') return;
 
         const drops = Number(tx.Amount);
         const xrp = drops / 1_000_000;
-        if (!Number.isFinite(xrp) || xrp < (MIN_XRP / 1_000_000)) return;
+        // MIN_XRP is in XRP; compare directly
+        if (!Number.isFinite(xrp) || xrp < MIN_XRP) return;
 
-        const known = await getWellKnown();
-        const xrpUsd = await getXrpPrice();
-
+        const [known, xrpUsd] = await Promise.all([getWellKnown(), getXrpPrice()]);
         const from = tx.Account;
         const to = tx.Destination;
-        const hash = msg?.transaction?.hash || msg?.hash || '';
-        const ts = msg?.validated ? new Date().toISOString() : new Date().toISOString(); // approximate; ledger close time available if you also subscribe to 'ledger'
+        const hash = tx.hash || msg?.hash || '';
+        const ts = new Date().toISOString();
 
         const direction = classifyDirection(from, to, known);
         const score = scoreEvent(xrp, direction, from, to, known);
@@ -202,32 +202,31 @@ async function startXRPLStream() {
           score
         };
 
-        // push + dedupe ring buffer
         liveBuffer.push(row);
         if (liveBuffer.length > MAX_BUFFER) liveBuffer.splice(0, liveBuffer.length - MAX_BUFFER);
-      } catch (e) {
-        console.warn('stream parse err', e);
-      }
+      } catch (_) {}
     });
 
-    xrplClient.on('disconnected', () => console.warn('XRPL WS disconnected'));
-    console.log(`XRPL WebSocket connected: ${XRPL_WS_URL}`);
+    xrplClient.on('disconnected', () => { liveConnected = false; console.warn('XRPL WS disconnected'); });
   } catch (e) {
-    console.error('XRPL WS connect error', e);
-    // Retry later
+    liveConnected = false;
+    console.error('XRPL WS connect error', e?.message || e);
     setTimeout(() => startXRPLStream().catch(()=>{}), 5000);
   }
 }
-startXRPLStream(); // fire and forget
+startXRPLStream();
 
-// ---- CORE FETCH (XRPSCAN primary) ------------------------------------------
+// ---------------- XRPSCAN PRIMARY ----------------
+// IMPORTANT: XRPSCAN stores Amount in **drops**; convert our XRP threshold to drops.
 async function fetchTopFlowsXRPSCAN({ sinceMinutes = 60, minXrp = MIN_XRP }) {
+  const minDrops = Math.floor(minXrp * 1_000_000); // XRP -> drops
+
   const body = {
     size: 200,
     bool: {
       must: [{ term: { TransactionType: 'Payment' } }],
       filter: [
-        { range: { 'Amount._value': { gte: minXrp } } },
+        { range: { 'Amount._value': { gte: minDrops } } },
         { range: { _date: { gte: `now-${sinceMinutes}m` } } }
       ]
     }
@@ -243,17 +242,17 @@ async function fetchTopFlowsXRPSCAN({ sinceMinutes = 60, minXrp = MIN_XRP }) {
   const recs = extractRecords(j);
   if (!Array.isArray(recs) || recs.length === 0) return [];
 
-  const known = await getWellKnown();
-  const xrpUsd = await getXrpPrice();
+  const [known, xrpUsd] = await Promise.all([getWellKnown(), getXrpPrice()]);
 
   const items = recs
     .map((h) => {
       const s = h?._source ?? h?.source ?? h;
 
+      // Amount could be object {_value (drops)} or number-string (drops)
       const amtRaw = getField(s, 'Amount', 'amount', 'value');
-      const amtXrp = typeof amtRaw === 'object'
-        ? Number(amtRaw?._value ?? 0)
-        : Number(amtRaw ?? 0);
+      const drops =
+        typeof amtRaw === 'object' ? Number(amtRaw?._value ?? 0) : Number(amtRaw ?? 0);
+      const amtXrp = drops / 1_000_000;
 
       const hash = getField(s, 'hash', 'tx', 'tx_hash', 'id') || '';
       const ts   = getField(s, '_date', 'date', 'timestamp') || new Date().toISOString();
@@ -284,41 +283,50 @@ async function fetchTopFlowsXRPSCAN({ sinceMinutes = 60, minXrp = MIN_XRP }) {
   return unique;
 }
 
-// Composite: try XRPSCAN, else live buffer
+// Composite: try XRPSCAN, fallback to live buffer (validated tx)
 async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
+  // Primary
   const primary = await fetchTopFlowsXRPSCAN({ sinceMinutes, minXrp });
-  if (primary.length > 0) return primary;
+  if (primary.length > 0) {
+    setCache('lastSource', 'xrpscan', 30_000);
+    return primary;
+  }
 
-  // Fallback: filter the live buffer by min amount + time window
+  // Fallback (live)
   const sinceMs = Date.now() - sinceMinutes * 60 * 1000;
-  const items = liveBuffer
-    .filter(r => r.amount_xrp >= (minXrp / 1_000_000) && new Date(r.ts).getTime() >= sinceMs);
+  const items = liveBuffer.filter(
+    r => r.amount_xrp >= minXrp && new Date(r.ts).getTime() >= sinceMs
+  );
   const unique = dedupe(items);
   unique.sort((a,b)=> (b.score - a.score) || (b.amount_xrp - a.amount_xrp) || (new Date(b.ts) - new Date(a.ts)));
+
+  setCache('lastSource', 'live', 30_000);
   return unique;
 }
 
-// ---- ROUTES -----------------------------------------------------------------
+// --------------- ROUTES ---------------
 app.get('/api/top-flows', async (req, res) => {
   try {
     const since = Math.min(24 * 60, parseInt(req.query.sinceMinutes || '60', 10));
-    const min = parseInt(req.query.minXrp || String(MIN_XRP), 10);
+    const min = Number(req.query.minXrp || MIN_XRP);
+
+    // IMPORTANT: do not cache empty arrays — only cache when non-empty
     const cacheKey = `top:${since}:${min}`;
     const c = getCache(cacheKey);
-    if (c) return res.json(c);
+    if (c && Array.isArray(c) && c.length) return res.json(c);
+
     const data = await fetchTopFlows({ sinceMinutes: since, minXrp: min });
-    setCache(cacheKey, data);
+    if (Array.isArray(data) && data.length) setCache(cacheKey, data, 20_000);
     res.json(data);
   } catch (e) {
-    console.error('/api/top-flows error', e);
-    res.json([]); // never 500
+    res.json([]);
   }
 });
 
 app.get('/api/exchange-heatmap', async (req, res) => {
   try {
     const since = Math.min(24 * 60, parseInt(req.query.sinceMinutes || '60', 10));
-    const min = parseInt(req.query.minXrp || String(MIN_XRP), 10);
+    const min = Number(req.query.minXrp || MIN_XRP);
     const flows = await fetchTopFlows({ sinceMinutes: since, minXrp: min });
 
     const heat = {};
@@ -340,21 +348,19 @@ app.get('/api/exchange-heatmap', async (req, res) => {
 
     res.json(arr);
   } catch (e) {
-    console.error('/api/exchange-heatmap error', e);
-    res.json([]); // never 500
+    res.json([]);
   }
 });
 
-app.get('/api/status', async (_req, res) => {
-  const price = await getXrpPrice();
-  const known = await getWellKnown();
+// Simple meta for UI/debug
+app.get('/api/meta', (_req, res) => {
+  const source = getCache('lastSource') || (liveConnected ? 'live' : 'unknown');
   res.json({
     ok: true,
-    price_usd: price,
-    well_known_count: Object.keys(known).length,
-    search_url: XRPSCAN_SEARCH_URL,
-    ws_url: XRPL_WS_URL,
-    live_buffer_size: liveBuffer.length
+    source,
+    ws_connected: liveConnected,
+    live_buffer: liveBuffer.length,
+    min_xrp_threshold: MIN_XRP
   });
 });
 
