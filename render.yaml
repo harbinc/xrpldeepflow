@@ -1,0 +1,14 @@
+services:
+  - type: web
+    name: xrpl-deepflow
+    env: node
+    plan: free
+    buildCommand: "npm install"
+    startCommand: "node server.js"
+    healthCheckPath: "/healthz"
+    autoDeploy: true
+    envVars:
+      - key: MIN_XRP
+        value: "1000000"
+      - key: NODE_ENV
+        value: "production"

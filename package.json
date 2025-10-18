@@ -1,0 +1,16 @@
+{
+  "name": "xrpl-deepflow-render",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "build": "echo 'no build step'"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "morgan": "^1.10.0",
+    "node-fetch": "^3.3.2"
+  }
+}
