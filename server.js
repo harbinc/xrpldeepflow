@@ -15,15 +15,15 @@ app.use(morgan('tiny'));
 app.use(cors());
 app.use(express.json());
 
-// Render/Heroku/etc. provide PORT
+// Env
 const PORT = process.env.PORT || 8080;
-const MIN_XRP = parseInt(process.env.MIN_XRP || '1000000', 10); // default ≥ 1M XRP
+const MIN_XRP = parseInt(process.env.MIN_XRP || '1000000', 10);
 const XRPSCAN_SEARCH_URL = process.env.XRPSCAN_SEARCH_URL || 'https://console.xrpscan.com/api/v1/search';
 const XRPSCAN_WELL_KNOWN = process.env.XRPSCAN_WELL_KNOWN || 'https://api.xrpscan.com/api/v1/names/well-known';
 const PRICE_API = process.env.PRICE_API || 'https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd';
 
-// ------------------------------------------------------------------
-// Tiny cache
+// ----------------------------------------------------------------------------
+// Cache
 const cache = new Map();
 const setCache = (k, v, ttlMs = 30_000) => cache.set(k, { v, exp: Date.now() + ttlMs });
 const getCache = (k) => {
@@ -31,7 +31,7 @@ const getCache = (k) => {
   return it && it.exp > Date.now() ? it.v : null;
 };
 
-// Helper: fetch with timeout
+// Fetch with timeout
 async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   const ctl = new AbortController();
   const t = setTimeout(() => ctl.abort(), timeoutMs);
@@ -42,9 +42,8 @@ async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
   }
 }
 
-// Normalize XRPSCAN responses that may change shape
+// XRPSCAN response normalization
 function extractRecords(j) {
-  // Accept common variations: [], {hits: []}, {hits:{hits:[]}}, {results:[]}, {data:[]}
   if (Array.isArray(j)) return j;
   if (Array.isArray(j?.hits)) return j.hits;
   if (Array.isArray(j?.hits?.hits)) return j.hits.hits;
@@ -73,7 +72,7 @@ async function getWellKnown() {
     return dict;
   } catch (e) {
     console.error('well-known fetch error', e);
-    return {}; // degrade gracefully
+    return {};
   }
 }
 
@@ -113,10 +112,33 @@ function scoreEvent(amt, direction, sender, receiver, known) {
   return Math.min(100, logSize + ent + dirb);
 }
 
-// ------------------------------------------------------------------
-// Robust search that soft-fails to []
+// ---- DEDUP HELPERS ----------------------------------------------------------
+function makeKey(row) {
+  // Prefer tx hash; fallback to a composite to avoid accidental drop if hash missing
+  return row.hash || `${row.from}|${row.to}|${row.amount_xrp}|${row.ledger_index || ''}|${new Date(row.ts).getTime()}`;
+}
+function dedupe(items) {
+  const byKey = new Map();
+  for (const it of items) {
+    const k = makeKey(it);
+    const prev = byKey.get(k);
+    // Keep the "better" record if duplicates appear (prefer with label info, larger amount, or newer ts)
+    if (!prev ||
+        (Number(it.amount_xrp) > Number(prev.amount_xrp)) ||
+        (!!it.fromLabel && !prev.fromLabel) ||
+        (!!it.toLabel && !prev.toLabel) ||
+        (new Date(it.ts) > new Date(prev.ts))) {
+      byKey.set(k, it);
+    }
+  }
+  return Array.from(byKey.values());
+}
+
+// Robust search
 async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
   const body = {
+    // some XRPSCAN variants accept top-level "size"
+    size: 200,
     bool: {
       must: [{ term: { TransactionType: 'Payment' } }],
       filter: [
@@ -139,19 +161,20 @@ async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
     return [];
   }
 
-  const records = extractRecords(j);
-  if (!Array.isArray(records) || records.length === 0) {
-    console.warn('XRPSCAN search unexpected shape / empty:', JSON.stringify(j).slice(0, 400));
+  const recs = extractRecords(j);
+  if (!Array.isArray(recs) || recs.length === 0) {
+    console.warn('XRPSCAN search unexpected/empty:', JSON.stringify(j).slice(0, 400));
     return [];
   }
 
   const known = await getWellKnown();
   const xrpUsd = await getXrpPrice();
 
-  const items = records
+  const items = recs
     .map((h) => {
       const s = h?._source ?? h?.source ?? h;
 
+      // amount could be object {_value} or number/string
       const amtRaw = getField(s, 'Amount', 'amount', 'value');
       const amtXrp = typeof amtRaw === 'object'
         ? Number(amtRaw?._value ?? 0)
@@ -181,18 +204,21 @@ async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
     })
     .filter((row) => Number.isFinite(row.amount_xrp) && row.amount_xrp >= (minXrp || 0));
 
-  items.sort(
+  // Deduplicate BEFORE sorting/aggregations
+  const unique = dedupe(items);
+
+  unique.sort(
     (a, b) =>
       (b.score - a.score) ||
       (b.amount_xrp - a.amount_xrp) ||
       (new Date(b.ts) - new Date(a.ts))
   );
 
-  return items;
+  return unique;
 }
 
-// ------------------------------------------------------------------
-// Routes (soft-fail to [] so UI stays up)
+// ----------------------------------------------------------------------------
+// Routes
 app.get('/api/top-flows', async (req, res) => {
   try {
     const since = Math.min(24 * 60, parseInt(req.query.sinceMinutes || '60', 10));
@@ -205,7 +231,7 @@ app.get('/api/top-flows', async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error('/api/top-flows error', e);
-    res.json([]); // <= no 500
+    res.json([]); // soft-fail
   }
 });
 
@@ -215,6 +241,7 @@ app.get('/api/exchange-heatmap', async (req, res) => {
     const min = parseInt(req.query.minXrp || String(MIN_XRP), 10);
     const flows = await fetchTopFlows({ sinceMinutes: since, minXrp: min });
 
+    // Aggregate from DEDUPED flows
     const heat = {};
     for (const f of flows) {
       const venue =
@@ -235,14 +262,12 @@ app.get('/api/exchange-heatmap', async (req, res) => {
     res.json(arr);
   } catch (e) {
     console.error('/api/exchange-heatmap error', e);
-    res.json([]); // <= no 500
+    res.json([]); // soft-fail
   }
 });
 
-// Health check for Render/uptime
+// Health + static
 app.get('/healthz', (req, res) => res.json({ ok: true }));
-
-// Static SPA
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.listen(PORT, '0.0.0.0', () =>
