@@ -15,15 +15,17 @@ app.use(morgan('tiny'));
 app.use(cors());
 app.use(express.json());
 
-// Env
+// ---- ENV
 const PORT = process.env.PORT || 8080;
 const MIN_XRP = parseInt(process.env.MIN_XRP || '1000000', 10);
-const XRPSCAN_SEARCH_URL = process.env.XRPSCAN_SEARCH_URL || 'https://console.xrpscan.com/api/v1/search';
-const XRPSCAN_WELL_KNOWN = process.env.XRPSCAN_WELL_KNOWN || 'https://api.xrpscan.com/api/v1/names/well-known';
-const PRICE_API = process.env.PRICE_API || 'https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd';
+const XRPSCAN_SEARCH_URL =
+  process.env.XRPSCAN_SEARCH_URL || 'https://console.xrpscan.com/api/v1/search';
+const XRPSCAN_WELL_KNOWN =
+  process.env.XRPSCAN_WELL_KNOWN || 'https://api.xrpscan.com/api/v1/names/well-known';
+const PRICE_API =
+  process.env.PRICE_API || 'https://api.coingecko.com/api/v3/simple/price?ids=ripple&vs_currencies=usd';
 
-// ----------------------------------------------------------------------------
-// Cache
+// ---- CACHE
 const cache = new Map();
 const setCache = (k, v, ttlMs = 30_000) => cache.set(k, { v, exp: Date.now() + ttlMs });
 const getCache = (k) => {
@@ -31,18 +33,54 @@ const getCache = (k) => {
   return it && it.exp > Date.now() ? it.v : null;
 };
 
-// Fetch with timeout
-async function fetchWithTimeout(url, opts = {}, timeoutMs = 15000) {
-  const ctl = new AbortController();
-  const t = setTimeout(() => ctl.abort(), timeoutMs);
-  try {
-    return await fetch(url, { ...opts, signal: ctl.signal });
-  } finally {
-    clearTimeout(t);
+// ---- FETCH HELPERS ----------------------------------------------------------
+function delay(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+async function fetchJsonSafe(url, opts = {}, { timeoutMs = 15000, retries = 2, backoffMs = 400 } = {}) {
+  // AbortController timeout
+  const attempt = async () => {
+    const ctl = new AbortController();
+    const t = setTimeout(() => ctl.abort(), timeoutMs);
+    try {
+      const res = await fetch(url, { ...opts, signal: ctl.signal });
+      const ctype = (res.headers.get('content-type') || '').toLowerCase();
+
+      // If status not OK, read text (if any) and throw
+      if (!res.ok) {
+        const msg = await res.text().catch(() => '');
+        throw new Error(`HTTP ${res.status} ${res.statusText} ${msg.slice(0, 200)}`);
+      }
+
+      // Content-type check; sometimes upstream returns text/empty on errors
+      if (ctype.includes('application/json')) {
+        return await res.json();
+      } else {
+        // try JSON parse as a fallback; if that fails, treat as empty
+        const txt = await res.text();
+        try { return JSON.parse(txt); } catch {
+          throw new Error(`Non-JSON response (${ctype || 'no ctype'}): ${txt.slice(0, 200)}`);
+        }
+      }
+    } finally {
+      clearTimeout(t);
+    }
+  };
+
+  let err;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await attempt();
+    } catch (e) {
+      err = e;
+      console.warn(`[fetchJsonSafe] attempt ${i + 1} failed:`, String(e).slice(0, 180));
+      if (i < retries) await delay(backoffMs * (i + 1));
+    }
   }
+  // As a last resort return null; callers decide default
+  return null;
 }
 
-// XRPSCAN response normalization
+// ---- XRPSCAN NORMALIZATION --------------------------------------------------
 function extractRecords(j) {
   if (Array.isArray(j)) return j;
   if (Array.isArray(j?.hits)) return j.hits;
@@ -63,35 +101,26 @@ async function getWellKnown() {
   const ck = 'well-known';
   const c = getCache(ck);
   if (c) return c;
-  try {
-    const r = await fetchWithTimeout(XRPSCAN_WELL_KNOWN, {}, 15000);
-    const arr = await r.json();
-    const dict = {};
-    for (const x of arr) dict[x.address] = x; // {address,label,category}
-    setCache(ck, dict, 10 * 60 * 1000);
-    return dict;
-  } catch (e) {
-    console.error('well-known fetch error', e);
-    return {};
+  const j = await fetchJsonSafe(XRPSCAN_WELL_KNOWN, {}, { timeoutMs: 15000, retries: 2 });
+  const dict = {};
+  if (Array.isArray(j)) {
+    for (const x of j) dict[x.address] = x; // {address,label,category}
   }
+  setCache(ck, dict, 10 * 60 * 1000);
+  return dict;
 }
 
 async function getXrpPrice() {
   const ck = 'xrp-usd';
   const c = getCache(ck);
   if (c) return c;
-  try {
-    const r = await fetchWithTimeout(PRICE_API, {}, 10000);
-    const j = await r.json();
-    const usd = j?.ripple?.usd || 0.5;
-    setCache(ck, usd, 30_000);
-    return usd;
-  } catch (e) {
-    console.error('price fetch error', e);
-    return 0.5;
-  }
+  const j = await fetchJsonSafe(PRICE_API, {}, { timeoutMs: 10000, retries: 1 });
+  const usd = j?.ripple?.usd ?? 0.5;
+  setCache(ck, usd, 30_000);
+  return usd;
 }
 
+// ---- CLASSIFY + SCORE -------------------------------------------------------
 function classifyDirection(sender, receiver, known) {
   const sKnown = !!known[sender];
   const rKnown = !!known[receiver];
@@ -101,7 +130,6 @@ function classifyDirection(sender, receiver, known) {
     return 'treasury';
   return 'p2p';
 }
-
 function scoreEvent(amt, direction, sender, receiver, known) {
   const logSize = Math.min(60, Math.floor(10 * Math.log10(Math.max(amt, 1))));
   let ent = 0;
@@ -112,9 +140,8 @@ function scoreEvent(amt, direction, sender, receiver, known) {
   return Math.min(100, logSize + ent + dirb);
 }
 
-// ---- DEDUP HELPERS ----------------------------------------------------------
+// ---- DEDUPE HELPERS ---------------------------------------------------------
 function makeKey(row) {
-  // Prefer tx hash; fallback to a composite to avoid accidental drop if hash missing
   return row.hash || `${row.from}|${row.to}|${row.amount_xrp}|${row.ledger_index || ''}|${new Date(row.ts).getTime()}`;
 }
 function dedupe(items) {
@@ -122,22 +149,23 @@ function dedupe(items) {
   for (const it of items) {
     const k = makeKey(it);
     const prev = byKey.get(k);
-    // Keep the "better" record if duplicates appear (prefer with label info, larger amount, or newer ts)
-    if (!prev ||
-        (Number(it.amount_xrp) > Number(prev.amount_xrp)) ||
-        (!!it.fromLabel && !prev.fromLabel) ||
-        (!!it.toLabel && !prev.toLabel) ||
-        (new Date(it.ts) > new Date(prev.ts))) {
+    if (
+      !prev ||
+      (Number(it.amount_xrp) > Number(prev.amount_xrp)) ||
+      (!!it.fromLabel && !prev.fromLabel) ||
+      (!!it.toLabel && !prev.toLabel) ||
+      (new Date(it.ts) > new Date(prev.ts))
+    ) {
       byKey.set(k, it);
     }
   }
   return Array.from(byKey.values());
 }
 
-// Robust search
+// ---- CORE FETCH -------------------------------------------------------------
 async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
+  // Body is intentionally permissive for XRPSCAN’s ES-like syntax variants
   const body = {
-    // some XRPSCAN variants accept top-level "size"
     size: 200,
     bool: {
       must: [{ term: { TransactionType: 'Payment' } }],
@@ -148,22 +176,24 @@ async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
     }
   };
 
-  let j;
-  try {
-    const r = await fetchWithTimeout(
-      XRPSCAN_SEARCH_URL,
-      { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) },
-      15000
-    );
-    j = await r.json();
-  } catch (e) {
-    console.error('XRPSCAN search fetch error:', e);
+  const j = await fetchJsonSafe(
+    XRPSCAN_SEARCH_URL,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body)
+    },
+    { timeoutMs: 15000, retries: 2, backoffMs: 500 }
+  );
+
+  if (!j) {
+    console.warn('XRPSCAN search returned null / non-JSON');
     return [];
   }
 
   const recs = extractRecords(j);
   if (!Array.isArray(recs) || recs.length === 0) {
-    console.warn('XRPSCAN search unexpected/empty:', JSON.stringify(j).slice(0, 400));
+    console.warn('XRPSCAN search empty/unexpected shape');
     return [];
   }
 
@@ -174,7 +204,6 @@ async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
     .map((h) => {
       const s = h?._source ?? h?.source ?? h;
 
-      // amount could be object {_value} or number/string
       const amtRaw = getField(s, 'Amount', 'amount', 'value');
       const amtXrp = typeof amtRaw === 'object'
         ? Number(amtRaw?._value ?? 0)
@@ -204,21 +233,17 @@ async function fetchTopFlows({ sinceMinutes = 60, minXrp = MIN_XRP }) {
     })
     .filter((row) => Number.isFinite(row.amount_xrp) && row.amount_xrp >= (minXrp || 0));
 
-  // Deduplicate BEFORE sorting/aggregations
   const unique = dedupe(items);
-
   unique.sort(
     (a, b) =>
       (b.score - a.score) ||
       (b.amount_xrp - a.amount_xrp) ||
       (new Date(b.ts) - new Date(a.ts))
   );
-
   return unique;
 }
 
-// ----------------------------------------------------------------------------
-// Routes
+// ---- ROUTES -----------------------------------------------------------------
 app.get('/api/top-flows', async (req, res) => {
   try {
     const since = Math.min(24 * 60, parseInt(req.query.sinceMinutes || '60', 10));
@@ -231,7 +256,7 @@ app.get('/api/top-flows', async (req, res) => {
     res.json(data);
   } catch (e) {
     console.error('/api/top-flows error', e);
-    res.json([]); // soft-fail
+    res.json([]); // never 500
   }
 });
 
@@ -241,7 +266,6 @@ app.get('/api/exchange-heatmap', async (req, res) => {
     const min = parseInt(req.query.minXrp || String(MIN_XRP), 10);
     const flows = await fetchTopFlows({ sinceMinutes: since, minXrp: min });
 
-    // Aggregate from DEDUPED flows
     const heat = {};
     for (const f of flows) {
       const venue =
@@ -262,12 +286,25 @@ app.get('/api/exchange-heatmap', async (req, res) => {
     res.json(arr);
   } catch (e) {
     console.error('/api/exchange-heatmap error', e);
-    res.json([]); // soft-fail
+    res.json([]); // never 500
   }
 });
 
-// Health + static
-app.get('/healthz', (req, res) => res.json({ ok: true }));
+// Simple status for troubleshooting
+app.get('/api/status', async (_req, res) => {
+  const price = await getXrpPrice();
+  const known = await getWellKnown();
+  res.json({
+    ok: true,
+    price_usd: price,
+    well_known_count: Object.keys(known).length,
+    search_url: XRPSCAN_SEARCH_URL
+  });
+});
+
+app.get('/healthz', (_req, res) => res.json({ ok: true }));
+
+// Static SPA
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.listen(PORT, '0.0.0.0', () =>
