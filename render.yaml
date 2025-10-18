@@ -12,3 +12,5 @@ services:
         value: "production"
       - key: MIN_XRP
         value: "1000000"
+      - key: XRPL_WS_URL
+        value: "wss://xrplcluster.com"
